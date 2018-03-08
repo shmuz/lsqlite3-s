@@ -372,6 +372,14 @@ static int dbvm_get_type(lua_State *L) {
     return 1;
 }
 
+static int dbvm_get_column_type(lua_State *L) {
+    sdb_vm *svm = lsqlite_checkvm(L, 1);
+    int index = luaL_checknumber(L, 2);
+    dbvm_check_index(L, svm, index);
+    lua_pushinteger(L, sqlite3_column_type(svm->vm, index));
+    return 1;
+}
+
 static int dbvm_get_values(lua_State *L) {
     sdb_vm *svm = lsqlite_checkvm(L, 1);
     sqlite3_stmt *vm = svm->vm;
@@ -2287,6 +2295,7 @@ static const luaL_Reg vmlib[] = {
     {"get_names",           dbvm_get_names          },
     {"get_type",            dbvm_get_type           },
     {"get_types",           dbvm_get_types          },
+    {"get_column_type",     dbvm_get_column_type    },
     {"get_uvalues",         dbvm_get_uvalues        },
     {"get_unames",          dbvm_get_unames         },
     {"get_utypes",          dbvm_get_utypes         },

@@ -1,0 +1,12 @@
+2018-March-03
+---------------
+Version "0.9.4_shmuz_0.1"
+
+Added a prepared statement method:
+
+    stmt:get_column_type(n)
+
+Returns the type of value at column n in the result set of statement stmt.
+- The left-most column is number 0.
+- The returned value is a number: sqlite3.INTEGER, sqlite3.FLOAT, ...
+- This method is a binding for sqlite3_column_type() function.
