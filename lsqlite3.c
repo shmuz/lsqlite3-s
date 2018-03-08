@@ -241,6 +241,7 @@ static int cleanupvm(lua_State *L, sdb_vm *svm) {
 }
 
 static int stepvm(lua_State *L, sdb_vm *svm) {
+    (void) L;
     return sqlite3_step(svm->vm);
 }
 
@@ -1323,7 +1324,6 @@ static void db_update_hook_callback(void *user, int op, char const *dbname, char
     sdb *db = (sdb*)user;
     lua_State *L = db->L;
     int top = lua_gettop(L);
-    lua_Number n;
 
     /* setup lua callback call */
     lua_rawgeti(L, LUA_REGISTRYINDEX, db->update_hook_cb);    /* get callback */
@@ -1839,20 +1839,16 @@ static int db_prepare(lua_State *L) {
     const char *sql = luaL_checkstring(L, 2);
     int sql_len = lua_strlen(L, 2);
     const char *sqltail;
-    sdb_vm *svm;
-    lua_settop(L,2); /* db,sql is on top of stack for call to newvm */
-    svm = newvm(L, db);
+    sqlite3_stmt *vm;
 
-    if (sqlite3_prepare_v2(db->db, sql, sql_len, &svm->vm, &sqltail) != SQLITE_OK) {
+    if (sqlite3_prepare_v2(db->db, sql, sql_len+1, &vm, &sqltail) == SQLITE_OK && vm != NULL) {
+        newvm(L, db)->vm = vm;
+        lua_pushstring(L, sqltail);
+    }
+    else {
         lua_pushnil(L);
         lua_pushinteger(L, sqlite3_errcode(db->db));
-        if (cleanupvm(L, svm) == 1)
-            lua_pop(L, 1); /* this should not happen since sqlite3_prepare_v2 will not set ->vm on error */
-        return 2;
     }
-
-    /* vm already in the stack */
-    lua_pushstring(L, sqltail);
     return 2;
 }
 

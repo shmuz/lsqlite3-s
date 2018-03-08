@@ -1,3 +1,9 @@
+2018-March-07
+---------------
+1. Fix: db:prepare(sql) returned a closed object when sql consisted of spaces only. Now it returns nil.
+2. Removed 2 compiler warnings.
+
+
 2018-March-03
 ---------------
 Version "0.9.4_shmuz_0.1"
