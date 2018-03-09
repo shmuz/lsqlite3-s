@@ -1,3 +1,14 @@
+2018-March-09
+---------------
+Added a prepared statement method:
+
+    stmt:get_column_text(n)
+
+Returns the textual representation of value at column n in the result set of statement stmt.
+- The left-most column is number 0.
+- This method is a binding for sqlite3_column_text() function.
+
+
 2018-March-07
 ---------------
 1. Fix: db:prepare(sql) returned a closed object when sql consisted of spaces only. Now it returns nil.
