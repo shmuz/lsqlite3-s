@@ -1,3 +1,60 @@
+2018-September-22
+
+1. db:prepare() accept an optional 2-nd argument: offset (integer; 0-based).
+
+2. db:prepare() returns the following values:
+
+     1. Compiled SQL statement (userdata), or nil.
+     2. Result code (integer; SQLITE_OK if no error occured).
+     3. Offset of "tail" in the 1-st argument (integer; 0-based).
+        This offset can be used as-is in the next db:prepare() call
+        during an iteration cycle over the 1-st argument.
+
+3. Added a prepared statement method:
+      stmt:sql()
+   Returns a string.
+
+
+2018-September-21
+-----------------
+1. db:exec() returns 2 values. The 2-nd value is either error message or nil.
+
+2. Added a function:
+
+      sqlite3.strglob(zStr, zGlob)
+
+   Both parameters are strings.
+   It returns a boolean (true in case of match).
+
+3. Added a function:
+
+      sqlite3.strlike(zStr, zGlob [,zEsc])
+
+   All parameters are strings. For zEsc, only the 1-st char matters.
+   It returns a boolean (true in case of match).
+
+4. Added a prepared statement method:
+
+      stmt:get_column_int(n)
+
+Returns the 32-bit INTEGER representation of value at column n in the result set of statement stmt.
+- The left-most column is number 0.
+- This method is a binding for sqlite3_column_int() function.
+
+5. Added a database method:
+
+      db:column_metadata(DbName, TableName, ColumnName)
+
+- All parameters are strings. Every parameter except TableName can be nil.
+Returns the following values:
+  1. Result (integer; sqlite3.OK on success)
+  2. Data type          (string)
+  3. Collating sequence (string)
+  4. NOT NULL           (boolean)
+  5. Primary key        (boolean)
+  6. Autoincrement      (boolean)
+
+
 2018-March-09
 ---------------
 Added a prepared statement method:

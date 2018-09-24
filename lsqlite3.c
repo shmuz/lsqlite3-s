@@ -92,9 +92,9 @@
     #define LSQLITE_OMIT_UPDATE_HOOK 0
 #endif
 #if defined(LSQLITE_OMIT_OPEN_V2)
-    #define SQLITE3_OPEN(L,filename,flags) sqlite3_open(L,filename)
+    #define SQLITE3_OPEN(filename,ppDb,flags) sqlite3_open(filename,ppDb)
 #else
-    #define SQLITE3_OPEN(L,filename,flags) sqlite3_open_v2(L,filename,flags,NULL)
+    #define SQLITE3_OPEN(filename,ppDb,flags) sqlite3_open_v2(filename,ppDb,flags,NULL)
 #endif
 
 typedef struct sdb sdb;
@@ -155,7 +155,7 @@ static const char *sqlite_bu_meta   = ":sqlite3:bu";
 static const char *sqlite_ctx_meta  = ":sqlite3:ctx";
 static int sqlite_ctx_meta_ref;
 
-/* Lua 5.3 introduced an integer type, but depending on the implementation, it could be 32 
+/* Lua 5.3 introduced an integer type, but depending on the implementation, it could be 32
 ** or 64 bits (or something else?). This helper macro tries to do "the right thing."
 */
 
@@ -418,6 +418,14 @@ static int dbvm_get_column_text(lua_State *L) {
     return 1;
 }
 
+static int dbvm_get_column_int(lua_State *L) {
+    sdb_vm *svm = lsqlite_checkvm(L, 1);
+    int index = luaL_checknumber(L, 2);
+    dbvm_check_index(L, svm, index);
+    lua_pushinteger(L, sqlite3_column_int(svm->vm, index));
+    return 1;
+}
+
 static int dbvm_get_values(lua_State *L) {
     sdb_vm *svm = lsqlite_checkvm(L, 1);
     sqlite3_stmt *vm = svm->vm;
@@ -675,7 +683,7 @@ static sdb *newdb (lua_State *L) {
     db->progress_cb =
     db->progress_udata =
     db->trace_cb =
-    db->trace_udata = 
+    db->trace_udata =
 #if !defined(LSQLITE_OMIT_UPDATE_HOOK) || !LSQLITE_OMIT_UPDATE_HOOK
     db->update_hook_cb =
     db->update_hook_udata =
@@ -1354,7 +1362,7 @@ static int db_trace(lua_State *L) {
 ** Params: database, callback function, userdata
 **
 ** callback function:
-** Params: userdata, {one of SQLITE_INSERT, SQLITE_DELETE, or SQLITE_UPDATE}, 
+** Params: userdata, {one of SQLITE_INSERT, SQLITE_DELETE, or SQLITE_UPDATE},
 **          database name, table name (containing the affected row), rowid of the row
 */
 static void db_update_hook_callback(void *user, int op, char const *dbname, char const *tblname, sqlite3_int64 rowid) {
@@ -1368,7 +1376,7 @@ static void db_update_hook_callback(void *user, int op, char const *dbname, char
     lua_pushinteger(L, op);
     lua_pushstring(L, dbname); /* update_hook database name */
     lua_pushstring(L, tblname); /* update_hook database name */
-    
+
     PUSH_INT64(L, rowid, lua_pushfstring(L, "%ll", rowid));
 
     /* call lua function */
@@ -1417,7 +1425,7 @@ static int db_update_hook(lua_State *L) {
 ** callback function:
 ** Params: userdata
 ** Returned value: Return false or nil to continue the COMMIT operation normally.
-**  return true (non false, non nil), then the COMMIT is converted into a ROLLBACK. 
+**  return true (non false, non nil), then the COMMIT is converted into a ROLLBACK.
 */
 static int db_commit_hook_callback(void *user) {
     sdb *db = (sdb*)user;
@@ -1843,6 +1851,7 @@ static int db_exec(lua_State *L) {
     sdb *db = lsqlite_checkdb(L, 1);
     const char *sql = luaL_checkstring(L, 2);
     int result;
+    char *errmsg = NULL;
 
     if (!lua_isnoneornil(L, 3)) {
         /* stack:
@@ -1856,15 +1865,22 @@ static int db_exec(lua_State *L) {
         lua_pushnil(L);     /* column names not known at this point */
         lua_newtable(L);    /* column values table */
 
-        result = sqlite3_exec(db->db, sql, db_exec_callback, L, NULL);
+        result = sqlite3_exec(db->db, sql, db_exec_callback, L, &errmsg);
     }
     else {
         /* no callbacks */
-        result = sqlite3_exec(db->db, sql, NULL, NULL, NULL);
+        result = sqlite3_exec(db->db, sql, NULL, NULL, &errmsg);
     }
 
     lua_pushinteger(L, result);
-    return 1;
+    if (errmsg) {
+      lua_pushstring(L, errmsg);
+      sqlite3_free(errmsg);
+    }
+    else
+      lua_pushnil(L);
+
+    return 2;
 }
 
 /*
@@ -1872,21 +1888,23 @@ static int db_exec(lua_State *L) {
 ** returns: code, compiled length or error message
 */
 static int db_prepare(lua_State *L) {
+    int result;
     sdb *db = lsqlite_checkdb(L, 1);
     const char *sql = luaL_checkstring(L, 2);
     int sql_len = lua_strlen(L, 2);
+    int offset = luaL_optinteger(L, 3, 0);
     const char *sqltail;
     sqlite3_stmt *vm;
 
-    if (sqlite3_prepare_v2(db->db, sql, sql_len+1, &vm, &sqltail) == SQLITE_OK && vm != NULL) {
+    offset = offset<0 ? 0 : offset>sql_len ? sql_len : offset;
+    result = sqlite3_prepare_v2(db->db, sql+offset, sql_len-offset+1, &vm, &sqltail);
+    if (result == SQLITE_OK && vm != NULL)
         newvm(L, db)->vm = vm;
-        lua_pushstring(L, sqltail);
-    }
-    else {
+    else
         lua_pushnil(L);
-        lua_pushinteger(L, sqlite3_errcode(db->db));
-    }
-    return 2;
+    lua_pushinteger(L, result);
+    lua_pushinteger(L, sqltail - sql);
+    return 3;
 }
 
 static int db_do_next_row(lua_State *L, int packed) {
@@ -1978,6 +1996,12 @@ static int dbvm_urows(lua_State *L) {
     return dbvm_do_rows(L, db_next_row);
 }
 
+static int dbvm_sql(lua_State *L) {
+    sdb_vm *svm = lsqlite_checkvm(L, 1);
+    lua_pushstring(L, sqlite3_sql(svm->vm));
+    return 1;
+}
+
 static int db_do_rows(lua_State *L, int(*f)(lua_State *)) {
     sdb *db = lsqlite_checkdb(L, 1);
     const char *sql = luaL_checkstring(L, 2);
@@ -2055,7 +2079,7 @@ static int db_close_vm(lua_State *L) {
 }
 
 /* From: Wolfgang Oertl
-When using lsqlite3 in a multithreaded environment, each thread has a separate Lua 
+When using lsqlite3 in a multithreaded environment, each thread has a separate Lua
 environment, but full userdata structures can't be passed from one thread to another.
 This is possible with lightuserdata, however. See: lsqlite_open_ptr().
 */
@@ -2070,6 +2094,27 @@ static int db_gc(lua_State *L) {
     if (db->db != NULL)  /* ignore closed databases */
         cleanupdb(L, db);
     return 0;
+}
+
+/* sqlite3_table_column_metadata binding
+*/
+static int db_column_metadata(lua_State *L) {
+    int NotNull=0, PrimaryKey=0, Autoinc=0;
+    char const *zDataType=NULL, *zCollSeq=NULL;
+    sdb *db = lsqlite_getdb(L, 1);
+    const char *zDbName = luaL_optstring(L, 2, NULL);
+    const char *zTableName = luaL_checkstring(L, 3);
+    const char *zColumnName = luaL_optstring(L, 4, NULL);
+
+    int res = sqlite3_table_column_metadata(db->db, zDbName, zTableName,
+        zColumnName, &zDataType, &zCollSeq, &NotNull, &PrimaryKey, &Autoinc);
+    lua_pushinteger(L, res);
+    lua_pushstring(L, zDataType);
+    lua_pushstring(L, zCollSeq);
+    lua_pushboolean(L, NotNull ? 1:0);
+    lua_pushboolean(L, PrimaryKey ? 1:0);
+    lua_pushboolean(L, Autoinc ? 1:0);
+    return 6;
 }
 
 /*
@@ -2141,7 +2186,7 @@ static int lsqlite_open_memory(lua_State *L) {
 }
 
 /* From: Wolfgang Oertl
-When using lsqlite3 in a multithreaded environment, each thread has a separate Lua 
+When using lsqlite3 in a multithreaded environment, each thread has a separate Lua
 environment, but full userdata structures can't be passed from one thread to another.
 This is possible with lightuserdata, however. See: db_get_ptr().
 */
@@ -2179,6 +2224,25 @@ static int lsqlite_newindex(lua_State *L) {
 */
 static int lsqlite_lversion(lua_State *L) {
     lua_pushstring(L, LSQLITE_VERSION);
+    return 1;
+}
+
+/* sqlite3_strglob binding
+*/
+static int lsqlite_strglob(lua_State *L) {
+    const char* zStr = luaL_checkstring(L, 1);
+    const char* zGlob = luaL_checkstring(L, 2);
+    lua_pushboolean(L, sqlite3_strglob(zGlob, zStr) == 0);
+    return 1;
+}
+
+/* sqlite3_strlike binding
+*/
+static int lsqlite_strlike(lua_State *L) {
+    const char* zStr = luaL_checkstring(L, 1);
+    const char* zGlob = luaL_checkstring(L, 2);
+    const char* zEsc = luaL_optstring(L, 3, "");
+    lua_pushboolean(L, sqlite3_strlike(zGlob, zStr, zEsc[0]) == 0);
     return 1;
 }
 
@@ -2255,7 +2319,7 @@ static const struct {
     SC(OPEN_FULLMUTEX)
     SC(OPEN_SHAREDCACHE)
     SC(OPEN_PRIVATECACHE)
-    
+
     /* terminator */
     { NULL, 0 }
 };
@@ -2302,6 +2366,7 @@ static const luaL_Reg dblib[] = {
 
     {"__tostring",          db_tostring             },
     {"__gc",                db_gc                   },
+    {"column_metadata",     db_column_metadata      },
 
     {NULL, NULL}
 };
@@ -2330,9 +2395,11 @@ static const luaL_Reg vmlib[] = {
     {"get_types",           dbvm_get_types          },
     {"get_column_type",     dbvm_get_column_type    },
     {"get_column_text",     dbvm_get_column_text    },
+    {"get_column_int",      dbvm_get_column_int     },
     {"get_uvalues",         dbvm_get_uvalues        },
     {"get_unames",          dbvm_get_unames         },
     {"get_utypes",          dbvm_get_utypes         },
+    {"sql",                 dbvm_sql                },
 
     {"get_named_values",    dbvm_get_named_values   },
     {"get_named_types",     dbvm_get_named_types    },
@@ -2400,6 +2467,8 @@ static const luaL_Reg sqlitelib[] = {
     {"open_ptr",        lsqlite_open_ptr        },
 
     {"backup_init",     lsqlite_backup_init     },
+    {"strglob",         lsqlite_strglob         },
+    {"strlike",         lsqlite_strlike         },
 
     {"__newindex",      lsqlite_newindex        },
     {NULL, NULL}
