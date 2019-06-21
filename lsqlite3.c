@@ -1,6 +1,6 @@
 /************************************************************************
 * lsqlite3-s                                                            *
-* Copyright (C) 2018 Shmuel Zeigerman                                   *
+* Copyright (C) 2018-2019 Shmuel Zeigerman                              *
 * All rights reserved.                                                  *
 * Author    : Shmuel Zeigerman                                          *
 * Library   : lsqlite3-s - an SQLite 3 database binding for Lua 5       *
@@ -102,6 +102,13 @@ typedef struct sdb_vm sdb_vm;
 typedef struct sdb_bu sdb_bu;
 typedef struct sdb_func sdb_func;
 
+/* prevent closing DB connection from a duplicate handle's GC handler */
+enum {
+    CM_CAN_CLOSE,          /* setting for main connection      */
+    CM_NO_CLOSE_FROM_GC,   /* setting for duplicate connection */
+    CM_CANNOT_CLOSE,       /* implementation detail */
+};
+
 /* to use as C user data so i know what function sqlite is calling */
 struct sdb_func {
     /* references to associated lua values */
@@ -147,6 +154,7 @@ struct sdb {
     int rollback_hook_udata;
 
 #endif
+    int close_mark; /* behavior with regards to close attempt */
 };
 
 static const char *sqlite_meta      = ":sqlite3";
@@ -672,11 +680,12 @@ static int dbvm_bind_names(lua_State *L) {
 **
 ** Creates a new 'table' and leaves it in the stack
 */
-static sdb *newdb (lua_State *L) {
+static sdb *newdb (lua_State *L, int close_mark) {
     sdb *db = (sdb*)lua_newuserdata(L, sizeof(sdb));
     db->L = L;
     db->db = NULL;  /* database handle is currently `closed' */
     db->func = NULL;
+    db->close_mark = close_mark;
 
     db->busy_cb =
     db->busy_udata =
@@ -750,7 +759,10 @@ static int cleanupdb(lua_State *L, sdb *db) {
 #endif
 
     /* close database */
-    result = sqlite3_close(db->db);
+    if (db->close_mark != CM_CANNOT_CLOSE)
+        result = sqlite3_close(db->db);
+    else
+        result = SQLITE_OK;
     db->db = NULL;
 
     /* free associated memory with created functions */
@@ -2091,8 +2103,11 @@ static int db_get_ptr(lua_State *L) {
 
 static int db_gc(lua_State *L) {
     sdb *db = lsqlite_getdb(L, 1);
-    if (db->db != NULL)  /* ignore closed databases */
+    if (db->db != NULL) { /* ignore closed databases */
+        if (db->close_mark == CM_NO_CLOSE_FROM_GC)
+            db->close_mark = CM_CANNOT_CLOSE;
         cleanupdb(L, db);
+    }
     return 0;
 }
 
@@ -2156,7 +2171,7 @@ static int lsqlite_temp_directory(lua_State *L) {
 #endif
 
 static int lsqlite_do_open(lua_State *L, const char *filename, int flags) {
-    sdb *db = newdb(L); /* create and leave in stack */
+    sdb *db = newdb(L, CM_CAN_CLOSE); /* create and leave in stack */
 
     if (SQLITE3_OPEN(filename, &db->db, flags) == SQLITE_OK) {
         /* database handle already in the stack - return it */
@@ -2194,9 +2209,11 @@ static int lsqlite_open_ptr(lua_State *L) {
     sqlite3 *db_ptr;
     sdb *db;
     int rc;
+    int close_mark;
 
     luaL_checktype(L, 1, LUA_TLIGHTUSERDATA);
     db_ptr = lua_touserdata(L, 1);
+    close_mark = lua_toboolean(L, 2) ? CM_NO_CLOSE_FROM_GC : CM_CAN_CLOSE;
     /* This is the only API function that runs sqlite3SafetyCheck regardless of
      * SQLITE_ENABLE_API_ARMOR and does almost nothing (without an SQL
      * statement) */
@@ -2204,7 +2221,7 @@ static int lsqlite_open_ptr(lua_State *L) {
     if (rc != SQLITE_OK)
         luaL_argerror(L, 1, "not a valid SQLite3 pointer");
 
-    db = newdb(L); /* create and leave in stack */
+    db = newdb(L, close_mark); /* create and leave in stack */
     db->db = db_ptr;
     return 1;
 }
@@ -2243,6 +2260,901 @@ static int lsqlite_strlike(lua_State *L) {
     const char* zGlob = luaL_checkstring(L, 2);
     const char* zEsc = luaL_optstring(L, 3, "");
     lua_pushboolean(L, sqlite3_strlike(zGlob, zStr, zEsc[0]) == 0);
+    return 1;
+}
+
+/*
+** =======================================================
+** The Virtual Table Mechanism
+** =======================================================
+*/
+
+/* module client data */
+typedef struct {
+    lua_State *L;
+    sqlite3_module *module;
+} module_client_data;
+
+/* An instance of the virtual table */
+typedef struct {
+    sqlite3_vtab base; /* Base class. Must be first */
+    lua_State *L;
+} vtab_ext;
+
+/* Virtual Table Cursor Object */
+typedef struct {
+    sqlite3_vtab_cursor base; /* Virtual table of this cursor */
+    lua_State *L;
+} cursor_ext;
+
+static void SetVtabErrorMessage(vtab_ext *vtab)
+{
+    sqlite3_free(vtab->base.zErrMsg);
+    vtab->base.zErrMsg = sqlite3_mprintf("%s", lua_tostring(vtab->L, -1));
+}
+
+static int GetNumField(lua_State *L, const char *field, double *num)
+{
+    int ret = 0;
+    lua_getfield(L, -1, field);
+    if (lua_type(L, -1) == LUA_TNUMBER) {
+        *num = lua_tonumber(L, -1);
+        ret = 1;
+    }
+    lua_pop(L, 1);
+    return ret;
+}
+
+static int GetIntField(lua_State *L, const char *field, sqlite_int64 *num)
+{
+    int ret = 0;
+    lua_getfield(L, -1, field);
+    if (lua_type(L, -1) == LUA_TNUMBER) {
+        *num = lua_tointeger(L, -1);
+        ret = 1;
+    }
+    lua_pop(L, 1);
+    return ret;
+}
+
+static int GetModuleFunc(lua_State *L, void* regkey, const char* funcname, char **pzErr)
+{
+    int top = lua_gettop(L);
+    lua_pushlightuserdata(L, regkey);
+    lua_rawget(L, LUA_REGISTRYINDEX);                    /* +1 */
+    if (lua_istable(L, -1)) {
+        lua_getfield(L, -1, funcname);                   /* +2 */
+        if (lua_isfunction(L, -1)) {
+            lua_remove(L, -2);                           /* +1 */
+            return 1;
+        }
+    }
+    if (pzErr)
+      *pzErr = sqlite3_mprintf("function '%s' not found", funcname);
+    lua_settop(L, top);  /* +0 */
+    return 0;
+}
+
+static int GetModuleFunc2(vtab_ext *VT, const char *funcname)
+{
+    lua_State *L = VT->L;
+    int top = lua_gettop(L);
+    lua_pushlightuserdata(L, (void*)VT->base.pModule);
+    lua_rawget(L, LUA_REGISTRYINDEX);
+    if (lua_istable(L, -1)) {
+        lua_getfield(L, -1, funcname);                   /* +2 */
+        if (lua_isfunction(L, -1)) {
+            lua_remove(L, -2);                           /* +1 */
+            return 1;
+        }
+    }
+    lua_settop(L, top);  /* +0 */
+    return 0;
+}
+
+static int CreateOrConnect(
+    const char *funcname,
+    sqlite3 *db, void *pAux, int argc, const char* const* argv, sqlite3_vtab **ppVTab, char **pzErr)
+{
+    int ret = SQLITE_ERROR;
+    module_client_data* client_data = (module_client_data*) pAux;
+    lua_State *L = client_data->L;
+    if (GetModuleFunc(L, client_data->module, funcname, pzErr)) {  /* +1 */
+        int i;
+        sdb* Sdb = newdb(L, CM_NO_CLOSE_FROM_GC); /* +2; convert raw db to userdata db */
+        Sdb->db = db;
+        lua_pushvalue(L, -2);                     /* +3; push function */
+        lua_pushvalue(L, -2);                     /* +4; push db; prevent garbage collection */
+        lua_createtable(L, argc, 0);              /* +5; push arguments */
+        for (i=0; i<argc; i++) {
+            lua_pushstring(L, argv[i]);
+            lua_rawseti(L, -2, i+1);
+        }
+        if (0 == lua_pcall(L, 2, 2, 0)) {          /* +4 */
+            if (lua_type(L,-2) != LUA_TNIL && lua_type(L,-1) == LUA_TSTRING) {
+                vtab_ext* VT = (vtab_ext*)sqlite3_malloc(sizeof(vtab_ext));
+                memset(VT, 0, sizeof(vtab_ext));
+                VT->L = L;
+                lua_pushlightuserdata(L, VT);      /* +5; keep "virtual Lua table" in the registry */
+                lua_pushvalue(L, -3);              /* +6 */
+                lua_rawset(L, LUA_REGISTRYINDEX);  /* +4 */
+                *ppVTab = (sqlite3_vtab*) VT;
+                sqlite3_declare_vtab(db, lua_tostring(L,-1));
+                ret = SQLITE_OK;
+            }
+            else
+                *pzErr = sqlite3_mprintf("%s(): invalid return values", funcname);
+            lua_pop(L, 2);                         /* +2 */
+        }
+        else {
+            *pzErr = sqlite3_mprintf("%s", lua_tostring(L, -1));
+            lua_pop(L, 1);                         /* +2 */
+        }
+        lua_pop(L, 2);                             /* +0 */
+    }
+    return ret;
+}
+
+static int TableFunction1(const char *funcname, sqlite3_vtab *pVTab)
+{
+    int ret = SQLITE_ERROR;
+    vtab_ext *VT = (vtab_ext*) pVTab;
+    lua_State *L = VT->L;
+    if (GetModuleFunc2(VT, funcname))
+    {
+        lua_pushlightuserdata(L, VT);      /* +2 */
+        lua_rawget(L, LUA_REGISTRYINDEX);  /* +2 */
+        if (0 == lua_pcall(L, 1, 1, 0)) {
+            if (lua_type(L, -1) == LUA_TNUMBER)
+                ret = lua_tointeger(L, -1);
+        }
+        else
+            SetVtabErrorMessage(VT);
+        lua_pop(L, 1);
+    }
+    return ret;
+}
+
+static int TableFunction2(const char *funcname, sqlite3_vtab *pVTab, int savepoint)
+{
+    int ret = SQLITE_ERROR;
+    vtab_ext *VT = (vtab_ext*) pVTab;
+    lua_State *L = VT->L;
+    if (GetModuleFunc2(VT, funcname))
+    {
+        lua_pushlightuserdata(L, VT);      /* +2 */
+        lua_rawget(L, LUA_REGISTRYINDEX);  /* +2 */
+        lua_pushinteger(L, savepoint);     /* +3 */
+        if (0 == lua_pcall(L, 2, 1, 0)) {
+            if (lua_type(L, -1) == LUA_TNUMBER)
+                ret = lua_tointeger(L, -1);
+        }
+        else
+            SetVtabErrorMessage(VT);
+        lua_pop(L, 1);
+    }
+    return ret;
+}
+
+/*
+  mod.xCreate = function (db, args)
+    @param db   : database handler (a userdata)
+    @param args : array of arguments (a table)
+    @return1 : representation of a virtual table (usually a Lua table)
+    @return2 : SQL statement "CREATE TABLE ..." (a string)
+*/
+static int xCreate(sqlite3 *db, void *pAux, int argc, const char* const* argv,
+             sqlite3_vtab **ppVTab, char **pzErr)
+{
+    return CreateOrConnect("xCreate", db, pAux, argc, argv, ppVTab, pzErr);
+}
+
+/*
+  mod.xConnect = function (db, args)
+    @param db   : database handler (a userdata)
+    @param args : array of arguments (a table)
+    @return1 : representation of a virtual table (usually a Lua table)
+    @return2 : SQL statement "CREATE TABLE ..." (a string)
+*/
+static int xConnect(sqlite3 *db, void *pAux, int argc, const char* const* argv,
+             sqlite3_vtab **ppVTab, char **pzErr)
+{
+    return CreateOrConnect("xConnect", db, pAux, argc, argv, ppVTab, pzErr);
+}
+
+/*
+  mod.xBestIndex = function (vtable, aConstraint, aOrderBy) return { estimatedCost=1e6 } end
+    @param vtable      : virtual table, Lua representation
+    @param aConstraint : a table
+    @param aOrderBy    : a table
+    @return            : a table
+*/
+static int xBestIndex(sqlite3_vtab *pVTab, sqlite3_index_info* pIdxInfo)
+{
+    int ret = SQLITE_ERROR;
+    vtab_ext *VT = (vtab_ext*) pVTab;
+    lua_State *L = VT->L;
+    double dnum;
+    sqlite_int64 inum;
+    if (GetModuleFunc2(VT, "xBestIndex")) /* +1 */
+    {
+        int i;
+        lua_pushlightuserdata(L, VT);
+        lua_rawget(L, LUA_REGISTRYINDEX); /* +2 */
+
+        lua_newtable(L); /* +3; aConstraint array */
+        for (i=0; i<pIdxInfo->nConstraint; i++)
+        {
+            lua_newtable(L);
+            lua_pushinteger(L, pIdxInfo->aConstraint[i].iColumn);
+            lua_setfield(L, -2, "iColumn");
+            lua_pushinteger(L, pIdxInfo->aConstraint[i].op);
+            lua_setfield(L, -2, "op");
+            lua_pushboolean(L, pIdxInfo->aConstraint[i].usable);
+            lua_setfield(L, -2, "usable");
+            lua_rawseti(L, -2, i+1);
+        }
+
+        lua_newtable(L); /* +4; aOrderBy array */
+        for (i=0; i<pIdxInfo->nOrderBy; i++)
+        {
+            lua_newtable(L);
+            lua_pushinteger(L, pIdxInfo->aOrderBy[i].iColumn);
+            lua_setfield(L, -2, "iColumn");
+            lua_pushboolean(L, pIdxInfo->aOrderBy[i].desc);
+            lua_setfield(L, -2, "desc");
+            lua_rawseti(L, -2, i+1);
+        }
+
+        if (0 == lua_pcall(L, 3, 1, 0))  /* +1 in both cases */
+        {
+            if (lua_istable(L, -1))
+            {
+                lua_getfield(L, -1, "aConstraintUsage"); /* Lua code may reuse aConstraint arg */
+                if (lua_istable(L, -1)) {                /* to avoid creation of a few tables  */
+                    for (i=0; i<pIdxInfo->nConstraint; i++) {
+                        lua_rawgeti(L, -1, i+1);
+                        if (lua_istable(L, -1)) {
+                            if (GetIntField(L, "argvIndex", &inum))
+                                pIdxInfo->aConstraintUsage->argvIndex = (int)inum;
+                            lua_getfield(L, -1, "omit");
+                            pIdxInfo->aConstraintUsage->omit = lua_toboolean(L, -1);
+                            lua_pop(L, 1);
+                        }
+                        lua_pop(L, -1);
+                    }
+                }
+                lua_pop (L, 1);
+
+                if (GetIntField(L, "idxNum", &inum))
+                    pIdxInfo->idxNum = (int)inum;
+
+                lua_getfield(L, -1, "idxStr");
+                if (lua_type(L, -1) == LUA_TSTRING) {
+                    size_t len;
+                    const char *p = lua_tolstring(L, -1, &len);
+                    pIdxInfo->idxStr = (char*)sqlite3_malloc(len+1);
+                    pIdxInfo->needToFreeIdxStr = 1;
+                    memcpy(pIdxInfo->idxStr, p, len+1);
+                }
+                lua_pop (L, 1);
+
+                if (GetIntField(L, "orderByConsumed", &inum))
+                    pIdxInfo->orderByConsumed = (int)inum;
+
+                if (GetNumField(L, "estimatedCost", &dnum))
+                    pIdxInfo->estimatedCost = dnum;
+
+                if (sqlite3_libversion_number() >= 3008002) {
+                    if (GetIntField(L, "estimatedRows", &inum))
+                        pIdxInfo->estimatedRows = inum;
+                }
+                if (sqlite3_libversion_number() >= 3009000) {
+                    if (GetIntField(L, "idxFlags", &inum))
+                        pIdxInfo->idxFlags = (int)inum;
+                }
+                if (sqlite3_libversion_number() >= 3010000) {
+                    if (GetIntField(L, "colUsed", &inum))
+                        pIdxInfo->colUsed = (sqlite3_uint64)inum;
+                }
+
+                ret = SQLITE_OK;
+            }
+        }
+        else
+            SetVtabErrorMessage(VT);
+        lua_pop(L, 1);
+    }
+    return ret;
+}
+
+/*
+  mod.xDisconnect = function (vtable) ...... return 0 end
+    @param vtable : virtual table, Lua representation
+    @return       : integer
+*/
+static int xDisconnect(sqlite3_vtab *pVTab)
+{
+    return TableFunction1("xDisconnect", pVTab);
+}
+
+/*
+  mod.xDestroy = function (vtable) ......  return 0 end
+    @param vtable : virtual table, Lua representation
+    @return       : integer
+*/
+static int xDestroy(sqlite3_vtab *pVTab)
+{
+    int ret = SQLITE_OK;
+    vtab_ext *VT = (vtab_ext*) pVTab;
+    lua_State *L = VT->L;
+    if (GetModuleFunc2(VT, "xDestroy"))
+    {
+        lua_pushlightuserdata(L, VT);
+        lua_rawget(L, LUA_REGISTRYINDEX);
+        if (0 == lua_pcall(L, 1, 1, 0)) {
+            if (lua_type(L, -1) == LUA_TNUMBER)
+                ret = lua_tointeger(L, -1);
+        }
+        else
+            SetVtabErrorMessage(VT);
+        lua_pop(L, 1);
+    }
+    if (ret == SQLITE_OK) {
+        lua_pushlightuserdata(L, VT);
+        lua_pushnil(L);
+        lua_rawset(L, LUA_REGISTRYINDEX);
+        sqlite3_free(VT);
+    }
+    return ret;
+}
+
+/*
+  mod.xOpen = function(vtable) return { vtable=vtable; ...... } end
+    @param vtable : virtual table, Lua representation
+    @return       : cursor, Lua representation
+*/
+static int xOpen(sqlite3_vtab *pVTab, sqlite3_vtab_cursor **ppCursor)
+{
+    vtab_ext *VT = (vtab_ext*) pVTab;
+    lua_State *L = VT->L;
+    if (GetModuleFunc2(VT, "xOpen"))      /* +1 */
+    {
+        lua_pushlightuserdata(L, VT);     /* +2 */
+        lua_rawget(L, LUA_REGISTRYINDEX); /* +2 */
+        if (0 == lua_pcall(L, 1, 1, 0))   /* +1 */
+        {
+            cursor_ext* CE = (cursor_ext*)sqlite3_malloc(sizeof(cursor_ext));
+            memset(CE, 0, sizeof(cursor_ext));
+            CE->L = L;
+            lua_pushlightuserdata(L, CE);      /* +2; keep Lua cursor in the registry */
+            lua_pushvalue(L, -2);              /* +3 */
+            lua_rawset(L, LUA_REGISTRYINDEX);  /* +1 */
+            lua_pop(L, 1);                     /* +0 */
+            *ppCursor = (sqlite3_vtab_cursor*) CE;
+            return SQLITE_OK;
+        }
+        else
+            SetVtabErrorMessage(VT);
+        lua_pop(L, 1);
+    }
+    return SQLITE_ERROR;
+}
+
+/*
+  mod.xClose = function(cursor) ......  return 0 end
+    @param cursor : cursor, Lua representation
+    @return       : integer
+*/
+static int xClose(sqlite3_vtab_cursor *pCursor)
+{
+    int ret = SQLITE_OK;
+    cursor_ext *CE = (cursor_ext*) pCursor;
+    vtab_ext *VT = (vtab_ext*) pCursor->pVtab;
+    lua_State *L = CE->L;
+    if (GetModuleFunc2(VT, "xClose"))
+    {
+        lua_pushlightuserdata(L, CE);
+        lua_rawget(L, LUA_REGISTRYINDEX);
+        if (0 == lua_pcall(L, 1, 1, 0)) {
+            if (lua_type(L, -1) == LUA_TNUMBER)
+                ret = lua_tointeger(L, -1);
+        }
+        else
+            SetVtabErrorMessage(VT);
+        lua_pop(L, 1);
+    }
+    if (ret == SQLITE_OK) {
+        lua_pushlightuserdata(L, CE);
+        lua_pushnil(L);
+        lua_rawset(L, LUA_REGISTRYINDEX);
+        sqlite3_free(CE);
+    }
+    return ret;
+}
+
+/*
+  mod.xFilter = function(cursor, idxNum, idxStr, argc) ......  return 0 end
+    @param cursor : cursor, Lua representation
+    @param idxNum : search index
+    @param idxStr : search index
+    @param argc   : argument counter
+    @param argv   : arguments (a table)
+    @return       : integer
+*/
+static int xFilter(sqlite3_vtab_cursor *pCursor, int idxNum, const char *idxStr,
+              int argc, sqlite3_value **argv)
+{
+    int ret = SQLITE_ERROR;
+    cursor_ext *CE = (cursor_ext*) pCursor;
+    vtab_ext *VT = (vtab_ext*) pCursor->pVtab;
+    lua_State *L = CE->L;
+    if (GetModuleFunc2(VT, "xFilter"))
+    {
+        int index;
+        lua_pushlightuserdata(L, CE);
+        lua_rawget(L, LUA_REGISTRYINDEX);  /* +2 */
+        lua_pushinteger(L, idxNum);        /* +3 */
+        lua_pushstring(L, idxStr);         /* +4 */
+        lua_pushinteger(L, argc);          /* +5 */
+        lua_newtable(L);                   /* +6 */
+        for (index=0; index<argc; index++) {
+            db_push_value(L, argv[index]);
+            lua_rawseti(L, -2, index+1);
+        }
+        if (0 == lua_pcall(L, 5, 1, 0)) {  /* +1 */
+            if (lua_type(L, -1) == LUA_TNUMBER)
+                ret = lua_tointeger(L, -1);
+        }
+        else
+            SetVtabErrorMessage(VT);
+        lua_pop(L, 1);
+    }
+    return ret;
+}
+
+/*
+  mod.xNext = function(cursor) ...... return 0 end
+    @param cursor : cursor, Lua representation
+    @return       : integer
+*/
+static int xNext(sqlite3_vtab_cursor *pCursor)
+{
+    int ret = SQLITE_ERROR;
+    cursor_ext *CE = (cursor_ext*) pCursor;
+    vtab_ext *VT = (vtab_ext*) pCursor->pVtab;
+    lua_State *L = CE->L;
+    if (GetModuleFunc2((vtab_ext*)pCursor->pVtab, "xNext"))
+    {
+        lua_pushlightuserdata(L, CE);
+        lua_rawget(L, LUA_REGISTRYINDEX);
+        if (0 == lua_pcall(L, 1, 1, 0)) {
+            if (lua_type(L, -1) == LUA_TNUMBER)
+                ret = lua_tointeger(L, -1);
+        }
+        else
+            SetVtabErrorMessage(VT);
+        lua_pop(L, 1);
+    }
+    return ret;
+}
+
+/*
+  mod.xEof = function(cursor) ...... return true end
+    @param cursor : cursor, Lua representation
+    @return       : boolean
+*/
+static int xEof(sqlite3_vtab_cursor *pCursor)
+{
+    int ret = 1; /* default is true to avoid hanging */
+    cursor_ext *CE = (cursor_ext*) pCursor;
+    vtab_ext *VT = (vtab_ext*) pCursor->pVtab;
+    lua_State *L = CE->L;
+    if (GetModuleFunc2((vtab_ext*)pCursor->pVtab, "xEof"))
+    {
+        lua_pushlightuserdata(L, CE);
+        lua_rawget(L, LUA_REGISTRYINDEX);
+        if (0 == lua_pcall(L, 1, 1, 0))
+            ret = lua_toboolean(L, -1);
+        else
+            SetVtabErrorMessage(VT);
+        lua_pop(L, 1);
+    }
+    return ret;
+}
+
+enum {
+    T_BLOB   =1,
+    T_DOUBLE =2,
+    T_INT    =3,
+    T_INT64  =4,
+    T_NULL   =5,
+    T_TEXT   =6,
+};
+
+/*
+  mod.xColumn = function(cursor, colnum)
+    @param cursor : cursor, Lua representation
+    @param colnum : column number
+    @return1      : value type (integer)
+    @return2      : value
+*/
+static int xColumn(sqlite3_vtab_cursor *pCursor, sqlite3_context *context, int nColNum)
+{
+    if (sqlite3_vtab_nochange(context))
+        return SQLITE_OK;
+    else {
+        int ret = SQLITE_ERROR;
+        cursor_ext *CE = (cursor_ext*) pCursor;
+        vtab_ext *VT = (vtab_ext*) pCursor->pVtab;
+        lua_State *L = CE->L;
+        if (GetModuleFunc2(VT, "xColumn"))
+        {
+            lua_pushlightuserdata(L, CE);
+            lua_rawget(L, LUA_REGISTRYINDEX);
+            lua_pushinteger(L, nColNum);
+            if (0 == lua_pcall(L, 2, 2, 0)) {
+                sqlite3_int64 i64;
+                size_t len;
+                const char *str;
+                switch(lua_tointeger(L, -2)) {
+                    case T_BLOB:
+                        if (lua_type(L, -1) == LUA_TSTRING) {
+                            str = lua_tolstring(L, -1, &len);
+                            sqlite3_result_blob(context, str, len, NULL);
+                        }
+                        break;
+                    case T_DOUBLE:
+                        sqlite3_result_double(context, lua_tonumber(L, -1));
+                        break;
+                    case T_INT:
+                        sqlite3_result_int(context, lua_tointeger(L, -1));
+                        break;
+                    case T_INT64:
+                        i64 = (sqlite3_int64)lua_tonumber(L, -1); /* possible data loss? */
+                        sqlite3_result_int64(context, i64);
+                        break;
+                    case T_TEXT:
+                        if (lua_type(L, -1) == LUA_TSTRING) {
+                            str = lua_tolstring(L, -1, &len);
+                            sqlite3_result_text(context, str, len, NULL);
+                        }
+                        break;
+                    default:
+                    case T_NULL:
+                        sqlite3_result_null(context);
+                        break;
+                }
+                lua_pop(L, 2);
+                ret = SQLITE_OK;
+            }
+            else {
+                SetVtabErrorMessage(VT);
+                lua_pop(L, 1);
+            }
+        }
+        return ret;
+    }
+}
+
+/*
+  mod.xRowid = function(cursor)
+    @param cursor : cursor, Lua representation
+    @return       : rowid (number) on success; nil on failure
+*/
+static int xRowid(sqlite3_vtab_cursor *pCursor, sqlite3_int64 *pRowid)
+{
+    int ret = SQLITE_ERROR;
+    vtab_ext *VT = (vtab_ext*) pCursor->pVtab;
+    cursor_ext *CE = (cursor_ext*) pCursor;
+    lua_State *L = CE->L;
+    if (GetModuleFunc2(VT, "xRowid")) {
+        lua_pushlightuserdata(L, CE);
+        lua_rawget(L, LUA_REGISTRYINDEX);
+        if (0 == lua_pcall(L, 1, 1, 0)) {
+            if (lua_type(L, -1) == LUA_TNUMBER) {
+                *pRowid = (sqlite3_int64)lua_tonumber(L, -1);
+                ret = SQLITE_OK;
+            }
+        }
+        else
+            SetVtabErrorMessage(VT);
+        lua_pop(L, 1);
+    }
+    return ret;
+}
+
+/*
+  mod.xUpdate = function(vtable, rowid1, rowid2, argc, args)
+    @param vtable : virtual table, Lua representation
+    @param rowid1 : either number or nil
+    @param rowid2 : either number or nil
+    @param argc   : number of items in the following table or nil
+    @param args   : arguments (either nil or array with length = number of columns),
+                    Note: if some argument argN==false then its value should stay unchanged.
+    @return1      : boolean
+    @return2      : either number (rowid) or nil
+*/
+static int xUpdate(sqlite3_vtab *pVTab, int argc, sqlite3_value **argv, sqlite3_int64 *pRowid)
+{
+    int ret = SQLITE_ERROR;
+    vtab_ext *VT = (vtab_ext*) pVTab;
+    lua_State *L = VT->L;
+    int top = lua_gettop(L);
+    if (GetModuleFunc2(VT, "xUpdate"))
+    {
+        int index;
+        lua_pushlightuserdata(L, VT);              /* +2 */
+        lua_rawget(L, LUA_REGISTRYINDEX);          /* +2 */
+        for (index=0; index<2; index++) {
+            if (index < argc)
+                db_push_value(L, argv[index]);
+            else
+                lua_pushnil(L);
+        }                                          /* +4 */
+        if (argc > 2) {
+            lua_pushinteger(L, argc-2);            /* +5 */
+            for (index=2; index<argc; index++) {
+                sqlite3_value *arg = argv[index];
+                if (index == 2)
+                    lua_newtable(L);               /* +6 */
+                if (sqlite3_value_nochange(arg))
+                    lua_pushboolean(L, 0);     /* convention: false means "unchanged" */
+                else
+                    db_push_value(L, arg);
+                lua_rawseti(L, -2, index-1);
+            }
+        }
+        index = (argc <= 2) ? 3 : 5;
+        if (0 == lua_pcall(L, index, 2, 0)) {
+            if (lua_toboolean(L, -2)) {
+                if (lua_type(L, -1) == LUA_TNUMBER)
+                    *pRowid = (sqlite3_int64)lua_tonumber(L, -1); /* possible data loss */
+                ret = SQLITE_OK;
+            }
+        }
+        else
+            SetVtabErrorMessage(VT);
+    }
+    lua_settop(L, top);
+    return ret;
+}
+
+/*
+  mod.xBegin = function(vtable)
+    @param vtable : virtual table, Lua representation
+    @return       : integer
+*/
+static int xBegin(sqlite3_vtab *pVTab)
+{
+    return TableFunction1("xBegin", pVTab);
+}
+
+/*
+  mod.xSync = function(vtable)
+    @param vtable : virtual table, Lua representation
+    @return       : integer
+*/
+static int xSync(sqlite3_vtab *pVTab)
+{
+    return TableFunction1("xSync", pVTab);
+}
+
+/*
+  mod.xCommit = function(vtable)
+    @param vtable : virtual table, Lua representation
+    @return       : integer
+*/
+static int xCommit(sqlite3_vtab *pVTab)
+{
+    return TableFunction1("xCommit", pVTab);
+}
+
+/*
+  mod.xRollback = function(vtable)
+    @param vtable : virtual table, Lua representation
+    @return       : integer
+*/
+static int xRollback(sqlite3_vtab *pVTab)
+{
+    return TableFunction1("xRollback", pVTab);
+}
+
+/*
+  NOT FINISHED.
+*/
+static int xFindFunction(sqlite3_vtab *pVTab, int nArg, const char *zName,
+                     void (**pxFunc)(sqlite3_context*,int,sqlite3_value**),
+                     void **ppArg)
+{
+    (void) pxFunc;
+    (void) ppArg;
+
+    int ret = 0;
+    vtab_ext *VT = (vtab_ext*) pVTab;
+    lua_State *L = VT->L;
+    if (GetModuleFunc2(VT, "xFindFunction"))
+    {
+        lua_pushlightuserdata(L, VT);
+        lua_rawget(L, LUA_REGISTRYINDEX);       /* +2 */
+        lua_pushinteger(L, nArg);               /* +3 */
+        lua_pushstring(L, zName);               /* +4 */
+        if (0 == lua_pcall(L, 3, 1, 0)) {       /* +1 */
+            if (lua_type(L, -1) == LUA_TNUMBER)
+                ret = lua_tointeger(L, -1);
+        }
+        else
+            SetVtabErrorMessage(VT);
+        lua_pop(L, 1);
+    }
+    return ret;
+}
+
+/*
+  mod.xRename = function(vtable, zNew)
+    @param vtable : virtual table, Lua representation
+    @param vtable : new name (string)
+    @return       : integer
+*/
+static int xRename(sqlite3_vtab *pVTab, const char *zNew)
+{
+    int ret = SQLITE_ERROR;
+    vtab_ext *VT = (vtab_ext*) pVTab;
+    lua_State *L = VT->L;
+    if (GetModuleFunc2(VT, "xRename"))
+    {
+        lua_pushlightuserdata(L, VT);
+        lua_rawget(L, LUA_REGISTRYINDEX);  /* +2 */
+        lua_pushstring(L, zNew);           /* +3 */
+        if (0 == lua_pcall(L, 2, 1, 0)) {  /* +1 */
+            if (lua_type(L, -1) == LUA_TNUMBER)
+                ret = lua_tointeger(L, -1);
+        }
+        else
+            SetVtabErrorMessage(VT);
+        lua_pop(L, 1);
+    }
+    return ret;
+}
+
+/*
+  mod.xSavepoint = function(vtable, savepoint)
+    @param vtable    : virtual table, Lua representation
+    @param savepoint : integer
+    @return          : integer
+*/
+static int xSavepoint(sqlite3_vtab *pVTab, int savepoint)
+{
+    return TableFunction2("xSavepoint", pVTab, savepoint);
+}
+
+/*
+  mod.xRelease = function(vtable, savepoint)
+    @param vtable    : virtual table, Lua representation
+    @param savepoint : integer
+    @return          : integer
+*/
+static int xRelease(sqlite3_vtab *pVTab, int savepoint)
+{
+    return TableFunction2("xRelease", pVTab, savepoint);
+}
+
+/*
+  mod.xRollbackTo = function(vtable, savepoint)
+    @param vtable    : virtual table, Lua representation
+    @param savepoint : integer
+    @return          : integer
+*/
+static int xRollbackTo(sqlite3_vtab *pVTab, int savepoint)
+{
+    return TableFunction2("xRollbackTo", pVTab, savepoint);
+}
+
+/*
+  NOT FINISHED.
+*/
+static int xShadowName(const char *cc)
+{
+    (void) cc;
+    return 0;
+}
+
+/*
+  mod.DestroyModule = function()
+    @return : nothing
+*/
+static void DestroyModule(void *data)
+{
+    module_client_data *client_data = (module_client_data*) data;
+    lua_State *L = client_data->L;
+
+    if (GetModuleFunc(L, client_data->module, "DestroyModule", NULL)) { /* use for debugging */
+        if (0 != lua_pcall(L, 0, 0, 0))
+            lua_pop(L, 1);
+    }
+
+    lua_pushlightuserdata(L, client_data->module); /* remove the module reference */
+    lua_pushnil(L);
+    lua_rawset(L, LUA_REGISTRYINDEX);
+    lua_pushlightuserdata(L, L);        /* remove the thread reference */
+    lua_pushnil(L);
+    lua_rawset(L, LUA_REGISTRYINDEX);
+    sqlite3_free(client_data->module);  /* free the module */
+    sqlite3_free(client_data);          /* free the client data */
+}
+
+#define SETPOINTER(Name) {                 \
+    lua_getfield(L, MODINDEX, #Name);      \
+    if (lua_type(L, -1) == LUA_TFUNCTION)  \
+        module->Name = Name;               \
+    lua_pop(L, 1); }
+
+/*
+  -- This method is a binding of sqlite3_create_module() function.
+  db:create_module(modname, modtable)
+    @param db       : database connection (as created by sqlite3.open())
+    @param modname  : module name; string
+    @param modtable : table containing module's functions
+    @return         : return value of sqlite3_create_module(); integer
+*/
+static int db_create_module(lua_State *L) {
+    const int        MODINDEX = 3;
+    int              ret;
+    sqlite3_module * module;
+    sdb            * Sdb;
+    const char     * zName;
+    module_client_data * client_data;
+
+    Sdb = lsqlite_checkdb(L, 1);
+    zName = luaL_checkstring(L, 2);
+    luaL_checktype(L, MODINDEX, LUA_TTABLE);
+
+    module = (sqlite3_module*) sqlite3_malloc(sizeof(sqlite3_module));
+    memset(module, 0, sizeof(sqlite3_module));
+    module->iVersion = 3;
+
+    client_data = (module_client_data*) sqlite3_malloc(sizeof(module_client_data));
+    client_data->module = module;
+    client_data->L = L;
+
+    lua_pushlightuserdata(L, module); /* for access from many callbacks */
+    lua_pushvalue(L, MODINDEX);
+    lua_rawset(L, LUA_REGISTRYINDEX);
+
+    lua_pushlightuserdata(L, L); /* create a reference to the thread: */
+    lua_pushthread(L);           /* the thread must not be GC'ed for as long as the module exists */
+    lua_rawset(L, LUA_REGISTRYINDEX);
+
+    /* Required methods, according to SQLite documentation */
+    /* If some of them is NULL the application might crash */
+    module->xConnect = xConnect;
+    module->xBestIndex = xBestIndex;
+    module->xDisconnect = xDisconnect;
+    module->xDestroy = xDestroy;
+    module->xOpen = xOpen;
+    module->xClose = xClose;
+    module->xFilter = xFilter;
+    module->xNext = xNext;
+    module->xEof = xEof;
+    module->xColumn = xColumn;
+    module->xRowid = xRowid;
+
+    /* Optional methods */
+    SETPOINTER(xCreate)
+    SETPOINTER(xUpdate)
+    SETPOINTER(xBegin)
+    SETPOINTER(xSync)
+    SETPOINTER(xCommit)
+    SETPOINTER(xRollback)
+    SETPOINTER(xFindFunction)
+    SETPOINTER(xRename)
+    SETPOINTER(xSavepoint)
+    SETPOINTER(xRelease)
+    SETPOINTER(xRollbackTo)
+    SETPOINTER(xShadowName)
+
+    ret = sqlite3_create_module_v2(Sdb->db, zName, module, client_data, DestroyModule);
+    lua_pushinteger(L, ret);
     return 1;
 }
 
@@ -2342,6 +3254,7 @@ static const luaL_Reg dblib[] = {
     {"create_aggregate",    db_create_aggregate     },
     {"create_collation",    db_create_collation     },
     {"load_extension",      db_load_extension       },
+    {"create_module",       db_create_module        },
 
     {"trace",               db_trace                },
     {"progress_handler",    db_progress_handler     },

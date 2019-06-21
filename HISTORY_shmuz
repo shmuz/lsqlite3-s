@@ -1,6 +1,21 @@
-2018-September-22
+2019-June-05
+------------
+1. sqlite3.open_ptr(db_ptr [,noclose])
+   The function accepts an optional 2-nd argument (boolean). Its meaning:
+     false : legacy behavior.
+     true  : mark the returned handle as not owning the database connection:
+             the connection will not be closed when the handle is garbage-collected.
 
-1. db:prepare() accept an optional 2-nd argument: offset (integer; 0-based).
+
+2019-June-01
+------------
+Add Lua binding of SQLite3 "module" functions (work with virtual tables).
+The only documentation for now is the comments in the source code.
+
+
+2018-September-22
+-----------------
+1. db:prepare() accepts an optional 2-nd argument: offset (integer; 0-based).
 
 2. db:prepare() returns the following values:
 
