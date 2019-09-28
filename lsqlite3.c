@@ -161,7 +161,6 @@ static const char *sqlite_meta      = ":sqlite3";
 static const char *sqlite_vm_meta   = ":sqlite3:vm";
 static const char *sqlite_bu_meta   = ":sqlite3:bu";
 static const char *sqlite_ctx_meta  = ":sqlite3:ctx";
-static int sqlite_ctx_meta_ref;
 
 /* Lua 5.3 introduced an integer type, but depending on the implementation, it could be 32
 ** or 64 bits (or something else?). This helper macro tries to do "the right thing."
@@ -804,7 +803,7 @@ typedef struct {
 
 static lcontext *lsqlite_make_context(lua_State *L) {
     lcontext *ctx = (lcontext*)lua_newuserdata(L, sizeof(lcontext));
-    lua_rawgeti(L, LUA_REGISTRYINDEX, sqlite_ctx_meta_ref);
+    luaL_getmetatable(L, sqlite_ctx_meta);
     lua_setmetatable(L, -2);
     ctx->ctx = NULL;
     ctx->ud = LUA_NOREF;
@@ -3405,9 +3404,6 @@ LUALIB_API int luaopen_lsqlite3(lua_State *L) {
     create_meta(L, sqlite_vm_meta, vmlib);
     create_meta(L, sqlite_bu_meta, dbbulib);
     create_meta(L, sqlite_ctx_meta, ctxlib);
-
-    luaL_getmetatable(L, sqlite_ctx_meta);
-    sqlite_ctx_meta_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 
     /* register (local) sqlite metatable */
     luaL_register(L, "sqlite3", sqlitelib);

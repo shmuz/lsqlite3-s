@@ -1,3 +1,9 @@
+2019-September-28
+-----------------
+Bugfix: remove global variable 'sqlite_ctx_meta_ref' that caused crashes
+when the library was used from unrelated lua_State's within one process.
+
+
 2019-June-05
 ------------
 1. sqlite3.open_ptr(db_ptr [,noclose])
