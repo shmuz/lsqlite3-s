@@ -1,3 +1,58 @@
+2020-January-10
+---------------
+1. Added a method:
+   blob = db:open_blob(zDb,zTable,zColumn,iRow,flags)
+     @param zDb:     string   (if nil then defaults to "main")
+     @param zTable:  string
+     @param zColumn: string
+     @param iRow:    integer
+     @param flags:   integer  (if nil then defaults to 0)
+     @return:        userdata (on success); nil,errorcode (on failure)
+   The returned userdata has in turn its own methods (see below).
+
+   1.1. blob:bytes()
+          @return:        integer
+
+   1.2. blob:read(N,Offset)
+          @param N:       integer
+          @param Offset:  integer
+          @return:        string (on success); nil,errorcode (on failure)
+
+   1.3. blob:write(Str,Offset)
+          @param Str:     string
+          @param Offset:  integer
+          @return:        true (on success); nil,errorcode (on failure)
+
+   1.4. blob:reopen(iRow)
+          @param iRow:    integer
+          @return:        true (on success); nil,errorcode (on failure)
+
+   1.5. blob:close()
+          @return:        true (on success); nil,errorcode (on failure)
+
+   1.6. blob:__tostring()
+
+   1.7. blob:__gc()
+
+2. Added a prepared statement method:
+   stmt:bind_zeroblob(index,size)
+     @param index:   integer
+     @param size:    integer
+     @return:        integer
+
+
+2019-December-27
+-----------------
+1. Added a method:
+   db:extended_errcode()
+       @return: integer
+
+2. Added a method:
+   db:extended_result_codes(turn_on)
+       @param turn_on: integer
+       @return: integer
+
+
 2019-September-28
 -----------------
 Bugfix: remove global variable 'sqlite_ctx_meta_ref' that caused crashes
@@ -17,6 +72,7 @@ when the library was used from unrelated lua_State's within one process.
 ------------
 Add Lua binding of SQLite3 "module" functions (work with virtual tables).
 The only documentation for now is the comments in the source code.
+[Requirement: SQLite >= 3.22.0]
 
 
 2018-September-22
@@ -46,6 +102,7 @@ The only documentation for now is the comments in the source code.
 
    Both parameters are strings.
    It returns a boolean (true in case of match).
+   [Requirement: SQLite >= 3.7.17]
 
 3. Added a function:
 
@@ -53,6 +110,7 @@ The only documentation for now is the comments in the source code.
 
    All parameters are strings. For zEsc, only the 1-st char matters.
    It returns a boolean (true in case of match).
+   [Requirement: SQLite >= 3.10.0]
 
 4. Added a prepared statement method:
 

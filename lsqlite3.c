@@ -84,6 +84,14 @@
 
 #include "sqlite3.h"
 
+/*
+ * The default value of 4000000 means "compile all functions".
+ * If the library should work, e.g, with SQLite3 version 3.4.5 then specify 3040500.
+*/
+#if !defined(SQLITE_VER)
+#define SQLITE_VER 4000000
+#endif
+
 /* compile time features */
 #if !defined(SQLITE_OMIT_PROGRESS_CALLBACK)
     #define SQLITE_OMIT_PROGRESS_CALLBACK 0
@@ -161,6 +169,7 @@ static const char *sqlite_meta      = ":sqlite3";
 static const char *sqlite_vm_meta   = ":sqlite3:vm";
 static const char *sqlite_bu_meta   = ":sqlite3:bu";
 static const char *sqlite_ctx_meta  = ":sqlite3:ctx";
+static const char *sqlite_blob_meta = ":sqlite3:blob";
 
 /* Lua 5.3 introduced an integer type, but depending on the implementation, it could be 32
 ** or 64 bits (or something else?). This helper macro tries to do "the right thing."
@@ -609,6 +618,15 @@ static int dbvm_bind_blob(lua_State *L) {
     return 1;
 }
 
+static int dbvm_bind_zeroblob(lua_State *L) {
+    sdb_vm *svm = lsqlite_checkvm(L, 1);
+    int index = luaL_checkint(L, 2);
+    int size = luaL_checkint(L, 3);
+
+    lua_pushinteger(L, sqlite3_bind_zeroblob(svm->vm, index, size));
+    return 1;
+}
+
 static int dbvm_bind_values(lua_State *L) {
     sdb_vm *svm = lsqlite_checkvm(L, 1);
     sqlite3_stmt *vm = svm->vm;
@@ -989,19 +1007,34 @@ static int db_errmsg(lua_State *L) {
     return 1;
 }
 
+static int db_extended_errcode(lua_State *L) {
+    sdb *db = lsqlite_checkdb(L, 1);
+    lua_pushinteger(L, sqlite3_extended_errcode(db->db));
+    return 1;
+}
+
+static int db_extended_result_codes(lua_State *L) {
+    sdb *db = lsqlite_checkdb(L, 1);
+    int turn_on = luaL_checkinteger(L, 2);
+    lua_pushinteger(L, sqlite3_extended_result_codes(db->db, turn_on));
+    return 1;
+}
+
 static int db_interrupt(lua_State *L) {
     sdb *db = lsqlite_checkdb(L, 1);
     sqlite3_interrupt(db->db);
     return 0;
 }
 
+#if (SQLITE_VER >= 3071000)
 static int db_db_filename(lua_State *L) {
     sdb *db = lsqlite_checkdb(L, 1);
     const char *db_name = luaL_checkstring(L, 2);
-    // sqlite3_db_filename may return NULL, in that case Lua pushes nil...
+    /* sqlite3_db_filename may return NULL, in that case Lua pushes nil... */
     lua_pushstring(L, sqlite3_db_filename(db->db, db_name));
     return 1;
 }
+#endif
 
 /*
 ** Registering SQL functions:
@@ -2243,6 +2276,7 @@ static int lsqlite_lversion(lua_State *L) {
     return 1;
 }
 
+#if (SQLITE_VER >= 3071700)
 /* sqlite3_strglob binding
 */
 static int lsqlite_strglob(lua_State *L) {
@@ -2251,7 +2285,9 @@ static int lsqlite_strglob(lua_State *L) {
     lua_pushboolean(L, sqlite3_strglob(zGlob, zStr) == 0);
     return 1;
 }
+#endif
 
+#if (SQLITE_VER >= 3100000)
 /* sqlite3_strlike binding
 */
 static int lsqlite_strlike(lua_State *L) {
@@ -2261,12 +2297,141 @@ static int lsqlite_strlike(lua_State *L) {
     lua_pushboolean(L, sqlite3_strlike(zGlob, zStr, zEsc[0]) == 0);
     return 1;
 }
+#endif
+
+/*
+*/
+static int db_open_blob(lua_State *L) {
+    sdb *db = lsqlite_checkdb(L, 1);
+    const char *zDb = luaL_optstring(L, 2, "main");
+    const char *zTable = luaL_checkstring(L, 3);
+    const char *zColumn = luaL_checkstring(L, 4);
+    sqlite3_int64 iRow = (sqlite3_int64)luaL_checknumber(L, 5);
+    int flags = luaL_optinteger(L, 6, 0);
+    sqlite3_blob **ppBlob = (sqlite3_blob**)lua_newuserdata(L, sizeof(sqlite3_blob*));
+    int ret = sqlite3_blob_open(db->db, zDb, zTable, zColumn, iRow, flags, ppBlob);
+    if (ret == SQLITE_OK) {
+        luaL_getmetatable(L, sqlite_blob_meta);
+        lua_setmetatable(L, -2);
+        return 1;
+    }
+    else {
+        lua_pushnil(L);
+        lua_pushinteger(L, ret);
+        return 2;
+    }
+}
+
+static sqlite3_blob **blob_getblob(lua_State *L, int index) {
+    return (sqlite3_blob**)luaL_checkudata(L, index, sqlite_blob_meta);
+}
+
+static sqlite3_blob **blob_checkblob(lua_State *L, int index) {
+    sqlite3_blob **pBlob = blob_getblob(L, index);
+    if (*pBlob == NULL) luaL_argerror(L, index, "attempt to use closed blob handle");
+    return pBlob;
+}
+
+static int blob_tostring(lua_State *L) {
+    sqlite3_blob **ppBlob = blob_getblob(L, 1);
+    if (*ppBlob)
+        lua_pushfstring(L, "blob handle (%p)", *ppBlob);
+    else
+        lua_pushstring(L, "blob handle (closed)");
+    return 1;
+}
+
+static int blob_close(lua_State *L) {
+    sqlite3_blob **ppBlob = blob_checkblob(L, 1);
+    int ret = sqlite3_blob_close(*ppBlob);
+    *ppBlob = NULL;
+    if (ret == SQLITE_OK) {
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+    else {
+        lua_pushnil(L);
+        lua_pushinteger(L, ret);
+        return 2;
+    }
+}
+
+static int blob_gc(lua_State *L) {
+    sqlite3_blob **ppBlob = blob_getblob(L, 1);
+    sqlite3_blob_close(*ppBlob);
+    *ppBlob = NULL;
+    return 0;
+}
+
+static int blob_bytes(lua_State *L) {
+    lua_pushinteger(L, sqlite3_blob_bytes(*blob_checkblob(L, 1)));
+    return 1;
+}
+
+static int blob_read(lua_State *L) {
+    int ret;
+    void *buf;
+    sqlite3_blob **ppBlob = blob_checkblob(L, 1);
+    lua_Integer N = luaL_checkinteger(L, 2);
+    lua_Integer iOffset = luaL_checkinteger(L, 3);
+    if (N < 0) N = 0;
+    if ((buf = malloc(N)) == NULL)
+        return luaL_error(L, "insufficient memory");
+    ret = sqlite3_blob_read(*ppBlob, buf, (int)N, (int)iOffset);
+    if (ret == SQLITE_OK) {
+        lua_pushlstring(L, buf, N);
+        free(buf);
+        return 1;
+    }
+    else {
+        free(buf);
+        lua_pushnil(L);
+        lua_pushinteger(L, ret);
+        return 2;
+    }
+}
+
+static int blob_write(lua_State *L) {
+    int ret;
+    size_t N;
+    sqlite3_blob **ppBlob = blob_checkblob(L, 1);
+    const char *str = luaL_checklstring(L, 2, &N);
+    lua_Integer iOffset = luaL_checkinteger(L, 3);
+    ret = sqlite3_blob_write(*ppBlob, str, (int)N, (int)iOffset);
+    if (ret == SQLITE_OK) {
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+    else {
+        lua_pushnil(L);
+        lua_pushinteger(L, ret);
+        return 2;
+    }
+}
+
+static int blob_reopen(lua_State *L) {
+    sqlite3_blob **ppBlob = blob_checkblob(L, 1);
+    sqlite3_int64 row = (sqlite3_int64)luaL_checknumber(L, 2);
+    int ret = sqlite3_blob_reopen(*ppBlob, row);
+    if (ret == SQLITE_OK) {
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+    else {
+        lua_pushnil(L);
+        lua_pushinteger(L, ret);
+        return 2;
+    }
+}
 
 /*
 ** =======================================================
 ** The Virtual Table Mechanism
+** (needs SQLite >= 3.22.0)
 ** =======================================================
 */
+
+#if (SQLITE_VER >= 3220000)
 
 /* module client data */
 typedef struct {
@@ -3156,6 +3321,7 @@ static int db_create_module(lua_State *L) {
     lua_pushinteger(L, ret);
     return 1;
 }
+#endif /* #if (SQLITE_VER >= 3220000) */
 
 /*
 ** =======================================================
@@ -3246,14 +3412,21 @@ static const luaL_Reg dblib[] = {
     {"error_code",          db_errcode              },
     {"errmsg",              db_errmsg               },
     {"error_message",       db_errmsg               },
+    {"extended_errcode",    db_extended_errcode     },
+    {"extended_result_codes", db_extended_result_codes },
     {"interrupt",           db_interrupt            },
+    {"open_blob",           db_open_blob            },
+#if (SQLITE_VER >= 3071000)
     {"db_filename",         db_db_filename          },
+#endif
 
     {"create_function",     db_create_function      },
     {"create_aggregate",    db_create_aggregate     },
     {"create_collation",    db_create_collation     },
     {"load_extension",      db_load_extension       },
+#if (SQLITE_VER >= 3220000)
     {"create_module",       db_create_module        },
+#endif
 
     {"trace",               db_trace                },
     {"progress_handler",    db_progress_handler     },
@@ -3296,6 +3469,7 @@ static const luaL_Reg vmlib[] = {
     {"bind_values",         dbvm_bind_values        },
     {"bind_names",          dbvm_bind_names         },
     {"bind_blob",           dbvm_bind_blob          },
+    {"bind_zeroblob",       dbvm_bind_zeroblob      },
     {"bind_parameter_count",dbvm_bind_parameter_count},
     {"bind_parameter_name", dbvm_bind_parameter_name},
 
@@ -3362,8 +3536,19 @@ static const luaL_Reg dbbulib[] = {
     {"pagecount",   dbbu_pagecount  },
     {"finish",      dbbu_finish     },
 
-//  {"__tostring",  dbbu_tostring   },
+/*  {"__tostring",  dbbu_tostring   }, */
     {"__gc",        dbbu_gc         },
+    {NULL, NULL}
+};
+
+static const luaL_Reg bloblib[] = {
+    {"__gc",        blob_gc         },
+    {"__tostring",  blob_tostring   },
+    {"bytes",       blob_bytes      },
+    {"close",       blob_close      },
+    {"read",        blob_read       },
+    {"reopen",      blob_reopen     },
+    {"write",       blob_write      },
     {NULL, NULL}
 };
 
@@ -3379,9 +3564,12 @@ static const luaL_Reg sqlitelib[] = {
     {"open_ptr",        lsqlite_open_ptr        },
 
     {"backup_init",     lsqlite_backup_init     },
+#if (SQLITE_VER >= 3071700)
     {"strglob",         lsqlite_strglob         },
+#endif
+#if (SQLITE_VER >= 3100000)
     {"strlike",         lsqlite_strlike         },
-
+#endif
     {"__newindex",      lsqlite_newindex        },
     {NULL, NULL}
 };
@@ -3404,6 +3592,7 @@ LUALIB_API int luaopen_lsqlite3(lua_State *L) {
     create_meta(L, sqlite_vm_meta, vmlib);
     create_meta(L, sqlite_bu_meta, dbbulib);
     create_meta(L, sqlite_ctx_meta, ctxlib);
+    create_meta(L, sqlite_blob_meta, bloblib);
 
     /* register (local) sqlite metatable */
     luaL_register(L, "sqlite3", sqlitelib);
