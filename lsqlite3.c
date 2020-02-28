@@ -175,6 +175,7 @@ static const char *sqlite_blob_meta = ":sqlite3:blob";
 ** or 64 bits (or something else?). This helper macro tries to do "the right thing."
 */
 
+/* The trick lua_pushnumber(L,n); n=lua_tonumber(L,-1); is needed to bypass compiler optimizations */
 #if LUA_VERSION_NUM > 502
 #define PUSH_INT64(L,i64in,fallback) \
     do { \
@@ -183,7 +184,8 @@ static const char *sqlite_blob_meta = ":sqlite3:blob";
         if (i == i64) lua_pushinteger(L, i);\
         else { \
             lua_Number n = (lua_Number)i64; \
-            if (n == i64) lua_pushnumber(L, n); \
+            lua_pushnumber(L, n); n = lua_tonumber(L, -1); lua_pop(L, 1); \
+            if ((sqlite_int64)n == i64) lua_pushnumber(L, n); \
             else fallback; \
         } \
     } while (0)
@@ -192,7 +194,8 @@ static const char *sqlite_blob_meta = ":sqlite3:blob";
     do { \
         sqlite_int64 i64 = i64in; \
         lua_Number n = (lua_Number)i64; \
-        if (n == i64) lua_pushnumber(L, n); \
+        lua_pushnumber(L, n); n = lua_tonumber(L, -1); lua_pop(L, 1); \
+        if ((sqlite_int64)n == i64) lua_pushnumber(L, n); \
         else fallback; \
     } while (0)
 #endif

@@ -1,3 +1,10 @@
+2020-February-12
+----------------
+1. Fix macro PUSH_INT64:
+   a) there was an incorrect comparison logic statement "if (n == i64)";
+   b) prevent compiler optimizations from affecting the comparison result;
+
+
 2020-January-10
 ---------------
 1. Added a method:
