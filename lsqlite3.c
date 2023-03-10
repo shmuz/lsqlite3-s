@@ -1,6 +1,6 @@
 /************************************************************************
 * lsqlite3-s                                                            *
-* Copyright (C) 2018-2019 Shmuel Zeigerman                              *
+* Copyright (C) 2018-2023 Shmuel Zeigerman                              *
 * All rights reserved.                                                  *
 * Author    : Shmuel Zeigerman                                          *
 * Library   : lsqlite3-s - an SQLite 3 database binding for Lua 5       *
@@ -70,7 +70,7 @@
 /* luaL_typerror always used with arg at ndx == NULL */
 #define luaL_typerror(L,ndx,str) luaL_error(L,"bad argument %d (%s expected, got nil)",ndx,str)
 /* luaL_register used once, so below expansion is OK for this case */
-#define luaL_register(L,name,reg) lua_newtable(L);luaL_setfuncs(L,reg,0)
+#define luaL_register(L,name,reg) luaL_setfuncs(L,reg,0)
 /* luaL_openlib always used with name == NULL */
 #define luaL_openlib(L,name,reg,nup) luaL_setfuncs(L,reg,nup)
 
@@ -199,6 +199,21 @@ static const char *sqlite_blob_meta = ":sqlite3:blob";
         else fallback; \
     } while (0)
 #endif
+
+/* This function replaces lua_pushfstring(L, "%ll")
+   as "%ll" is not listed as a valid conversion specifier
+   in the Lua 5.1 reference manual.
+*/
+static void push_str64(lua_State *L, sqlite_int64 val)
+{
+    char buf[32];
+#ifdef _WIN32
+    sprintf(buf, "%I64d", val);
+#else
+    sprintf(buf, "%lld", val);
+#endif
+    lua_pushstring(L, buf);
+}
 
 /*
 ** =======================================================
@@ -374,7 +389,7 @@ static int dbvm_last_insert_rowid(lua_State *L) {
     sdb_vm *svm = lsqlite_checkvm(L, 1);
     /* conversion warning: int64 -> luaNumber */
     sqlite_int64 rowid = sqlite3_last_insert_rowid(svm->db->db);
-    PUSH_INT64(L, rowid, lua_pushfstring(L, "%ll", rowid));
+    PUSH_INT64(L, rowid, push_str64(L, rowid));
     return 1;
 }
 
@@ -982,7 +997,7 @@ static int db_last_insert_rowid(lua_State *L) {
     sdb *db = lsqlite_checkdb(L, 1);
     /* conversion warning: int64 -> luaNumber */
     sqlite_int64 rowid = sqlite3_last_insert_rowid(db->db);
-    PUSH_INT64(L, rowid, lua_pushfstring(L, "%ll", rowid));
+    PUSH_INT64(L, rowid, push_str64(L, rowid));
     return 1;
 }
 
@@ -1424,7 +1439,7 @@ static void db_update_hook_callback(void *user, int op, char const *dbname, char
     lua_pushstring(L, dbname); /* update_hook database name */
     lua_pushstring(L, tblname); /* update_hook database name */
 
-    PUSH_INT64(L, rowid, lua_pushfstring(L, "%ll", rowid));
+    PUSH_INT64(L, rowid, push_str64(L, rowid));
 
     /* call lua function */
     lua_pcall(L, 5, 0, 0);
@@ -3598,7 +3613,8 @@ LUALIB_API int luaopen_lsqlite3(lua_State *L) {
     create_meta(L, sqlite_blob_meta, bloblib);
 
     /* register (local) sqlite metatable */
-    luaL_register(L, "sqlite3", sqlitelib);
+    lua_newtable(L);
+    luaL_register(L, NULL, sqlitelib);
 
     {
         int i = 0;
