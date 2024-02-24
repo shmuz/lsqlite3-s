@@ -2,7 +2,7 @@
 
 PROJECT   = lsqlite3
 MYLIBS    = -lsqlite3
-MYCFLAGS  = -DLSQLITE_VERSION=\"0.9.4_shmuz_0.1\" \
+MYCFLAGS  = -DLSQLITE_VERSION=\"0.9.5_shmuz\" \
             -DSQLITE_VER=$(SQLITE_VER)
 
 # This is the default, it means "compile all functions".
