@@ -1,3 +1,8 @@
+2024-May-07
+-----------
+1. Fix SQLite3 version handling.
+
+
 2024-February-24
 ----------------
 1. Fix macro PUSH_INT64 again.

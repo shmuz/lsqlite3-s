@@ -1,19 +1,7 @@
-# Makefile for lsqlite3 library for Lua
+# Project: lsqlite3
 
-LIBNAME= lsqlite3
+PROJECT   = lsqlite3
+MYLIBS    = -lsqlite3
+MYCFLAGS  = -DLSQLITE_VERSION=\"0.10.0_shmuz\"
 
-LUAEXE= lua
-
-ROCKSPEC= $(shell find . -name $(LIBNAME)-*-*.rockspec)
-
-all: install
-
-install:
-	luarocks make $(ROCKSPEC)
-
-test: 
-	$(LUAEXE) test/test.lua
-	$(LUAEXE) test/tests-sqlite3.lua lsqlite3
-	$(LUAEXE) test/tests-sqlite3.lua lsqlite3complete
-
-.PHONY: all test install
+include $(PATH_SYSTEM)/_mingw.mak
